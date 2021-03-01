@@ -1,6 +1,6 @@
 ### Declare variables
 $Alert = 0
-$DuoServiceAccountName = "DuoServiceAccount"
+$DuoServiceAccountName = "@DuoServiceAccountName@"
 
 $DuoVersion = "@DuoVersion@"
 $DuoVersionSplit = ($DuoVersion.Split('.'))[0]
@@ -12,8 +12,40 @@ if ([System.Int32]::Parse($DuoVersionSplit) -ge 5) {
 
 $ConfigFileContent = Get-Content "$DuoConfigPath\conf\authproxy.cfg"
 
-
 ### Functions
+
+function IsDuoRunning {
+	try {
+		$DuoServiceStatus = (Get-Service duoauthproxy).Status
+
+		if (!$DuoServiceStatus) {
+			Write-Output "Duo service can not be found. It does not appear to be installed properly."
+			$script:Alert = 1
+		} elseif ($DuoServiceStatus -eq "Running") {
+			Write-Output "Duo service is running."	
+		} else {
+			Write-Output "Duo service is not running."
+			$script:Alert = 1
+		}
+	} catch {
+		Write-Output "Error getting Duo service (duoauthproxy) status."
+		$script:Alert = 1
+	}
+
+	try {		
+		$DuoProcess = Get-Process proxy_svc
+
+		if (!$DuoProcess) {
+			Write-Output "Duo process is not running."
+			$script:Alert = 1
+		} else {
+			Write-Output "Duo process is running."
+		}
+	} catch {
+		Write-Output "Error getting Duo process (proxy_svc) status."
+		$script:Alert = 1
+	}
+}
 
 function CheckFailMode {
 	### Change or alert of "safe" instead of "secure"
@@ -38,7 +70,7 @@ function CheckSkeyProtect {
 
     if ($SkeySetting -match "skey_protected") {
         Write-Output "skey is properly configured (protected)."
-    } elseif ($SkeySetting -like "skey*=") {
+    } elseif ($SkeySetting) {
         Write-Output 'skey is not secured. skey needs to be protected.'
         $script:Alert = 1
     } else {
@@ -49,6 +81,18 @@ function CheckSkeyProtect {
 
 function CheckLDAPS {
 	### Alert if using LDAP instead of LDAPS
+}
+
+function CheckLogServiceUser {
+	$garbage,$ServiceUsername = ($ConfigFileContent | Where-Object { $_ -match "service_account_username" }) -split ('=') -replace (' ','')
+
+	if ($ServiceUsername -eq $DuoServiceAccountName) {
+		Write-Output "Duo's authproxy.cfg is using the correct AD account."
+	} elseif ($ServiceUsername) {
+		Write-Output "Duo authproxy.cfg does not appear to be using the correct AD account. This should be set as the service account granted least privilege."
+	} else {
+		Write-Output "Error finding Duo service account setting in authproxy.cfg."
+	}
 }
 
 function CheckServiceRunAsUser {
@@ -96,7 +140,7 @@ function CheckServiceAccountPermissions {
 		Write-Output "$DuoServiceAccountName user does not have permissions to the log directory."
 		$script:Alert = 1
 	} else {
-		$LogDirPermissionsCheck = $LogDirPermissions | Where-Object { ($_.FileSystemRights -like "*Modify*") -AND ($_.AccessControlType -eq "Allow") }
+		$LogDirPermissionsCheck = $LogDirPermissions | Where-Object { ($_.FileSystemRights -eq "Modify, Synchronize") -AND ($_.AccessControlType -eq "Allow") }
 		
 		if (!$LogDirPermissionsCheck) {
 			Write-Output "$DuoServiceAccountName user does have permissions to the log directory but they are not sufficient. Please adjust."
@@ -107,22 +151,84 @@ function CheckServiceAccountPermissions {
 	}
 	
 	### Check conf directory permissions
+	$ConfDirPermissions = (Get-Acl "$DuoConfigPath\conf").Access | 
+							Where-Object { $_.IdentityReference -like "*\$DuoServiceAccountName" }
+
+	if (!$ConfDirPermissions) {
+		Write-Output "$DuoServiceAccountName user does not have permissions to the log directory."
+		$script:Alert = 1
+	} else {
+		$ConfDirPermissionsCheck = $ConfDirPermissions | Where-Object { ($_.FileSystemRights -eq "ReadAndExecute, Synchronize") -AND ($_.AccessControlType -eq "Allow") }
+		
+		if (!$ConfDirPermissionsCheck) {
+			Write-Output "$DuoServiceAccountName user does have permissions to the conf directory but they are not sufficient. Please adjust."
+			$script:Alert = 1
+		} else {
+			Write-Output "$DuoServiceAccountName has appropriate permissions to the conf directory."
+		}
+	}
 	
 	### Check ProgramData directory permissions
-	
+	$ProgramDataPermissions = (Get-Acl "C:\ProgramData\Duo Authentication Proxy").Access | 
+							Where-Object { $_.IdentityReference -like "*\$DuoServiceAccountName" }
+
+	if (!$ProgramDataPermissions) {
+		Write-Output "$DuoServiceAccountName user does not have permissions to the Duo directory in ProgramData."
+		$script:Alert = 1
+	} else {
+		$ProgramDataPermissionsCheck = $ProgramDataPermissions | Where-Object { ($_.FileSystemRights -eq "Modify, Synchronize") -AND ($_.AccessControlType -eq "Allow") }
+		
+		if (!$ProgramDataPermissionsCheck) {
+			Write-Output "$DuoServiceAccountName user does have permissions to the Duo directory in ProgramData but they are not sufficient. Please adjust."
+			$script:Alert = 1
+		} else {
+			Write-Output "$DuoServiceAccountName has appropriate permissions to the Duo directory in ProgramData."
+		}
+	}
 }
 
-function CheckSyncStatus {
-	### Find a way to see if there are communication errors
-    # $AuthProxyLogLastFiveLines = Get-Content -Path "$DuoConfigPath\log\authproxy.log" -Tail 5
-    # Need to consider how to adequately determine if Duo is communicating.
+function TestDuoConnectivityTool {
+	try {    
+		$ConnectivityTool = & "$DuoConfigPath\bin\authproxy_connectivity_tool.exe"
+		$ConnectivityToolErrors = 0
+		$ConnectivityValidationErrors = 0
+	
+		if ($ConnectivityTool) {
+			$ConnectivityTool | ForEach-Object {
+				if ($_ -match "\[error\]") {
+					$ConnectivityToolErrors = 1
+					if ($_ -match "\[error\] Configuration validation was not successful") {
+						$ConnectivityValidationErrors = 1
+					}
+				}
+			}
+	
+			if ($ConnectivityToolErrors -eq 1) {
+			   $script:Alert = 1
+				Write-Output "Duo Connectivity Tool found configuration errors"
+				if ($ConnectivityValidationErrors -eq 1) {
+					Write-Output "Duo Connectivity Tool reported that configuration validation was not successful."
+				}
+			} else {
+				Write-Output "Duo Connectivity Tool reported no errors."
+			}
+		} else {
+			$script:Alert = 1
+			Write-Output "Duo Connectivity Tool produced no output."
+		}
+	} catch {
+		$script:Alert = 1
+		Write-Output "Error running Duo Connectivity Tool"
+	}	
 }
 
 
 ### Code logic
 
+IsDuoRunning
 CheckFailMode
 CheckSkeyProtect
-CheckLDAPS
+CheckLDAPS ### TODO
+CheckLogServiceUser
 CheckServiceRunAsUser ### If this function finds the service running at the correct user, it will check for least privileges
-CheckSyncStatus
+TestDuoConnectivityTool

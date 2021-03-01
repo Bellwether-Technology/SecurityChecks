@@ -1,6 +1,7 @@
 ### Declare variables
 
 $DuoServiceAccountName = "@DuoServiceAccountName@"
+$DuoServiceAccountPassword = "@DuoServiceAccountPassword@"
 
 $DuoVersion = "@DuoVersion@"
 $DuoVersionSplit = ($DuoVersion.Split('.'))[0]
@@ -41,6 +42,7 @@ function SetLogDirAcl {
         Write-Output "Error setting log directory ACL."
     }
 }
+
 function SetConfDirAcl {
     try {
         ### Set conf directory ACL
@@ -67,6 +69,21 @@ function SetProgramDataAcl {
     }
 }
 
+function SetServiceLogonUser {
+    $ServiceAccount = $DuoServiceAccountName
+    $ServicePass    = $DuoServiceAccountPassword
+    $ServiceName    = "DuoAuthProxy"
+    
+    $ServiceObject  = Get-WmiObject -Class Win32_Service -filter "Name='$ServiceName'"
+    
+    $ServiceObject.StopService() | Out-Null
+    
+    $ServiceObject | Invoke-WmiMethod -Name Change -ArgumentList @($null,$null,$null,$null,$null,$null,$null,$null,$null,$ServiceAccount,$ServicePass) | 
+                    Select-Object ReturnValue
+    
+    $ServiceObject.StartService() | Out-Null
+}
+
 
 ### Code logic
 
@@ -74,3 +91,4 @@ SetRegKeyAcl
 SetLogDirAcl
 SetConfDirAcl
 SetProgramDataAcl
+SetServiceLogonUser ### TODO: This function needs to be fixed so that the Service Account is prefixed with the domain. Otherwise, the command errors out. 
